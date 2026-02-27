@@ -13,7 +13,10 @@
 // ===================
 
 #define BUTTON_PIN 3
-#define EEPROM_ADDR 0
+#define EEPROM_ADDR_ALTITUDE 0
+#define EEPROM_ADDR_TEMP_OFFSET 4
+#define EEPROM_ADDR_PRESS_OFFSET 8
+#define SERIAL_BAUD 9600
 
 #define LONG_PRESS_TIME      500UL
 #define REPEAT_INTERVAL      200UL
@@ -25,9 +28,9 @@
 #define ALTITUDE_MAX     5000
 #define ALTITUDE_DEFAULT 230
 
-// Calibration offsets 
-#define TEMPERATURE_OFFSET -2.0f
-#define PRESSURE_OFFSET    0.0f
+// Calibration offset defaults
+#define TEMPERATURE_OFFSET_DEFAULT 0.0f
+#define PRESSURE_OFFSET_DEFAULT    0.0f
 
 #define FILTER_SIZE 5
 
@@ -68,6 +71,11 @@ static struct {
 } sensorData = {{0}, {0}, 0, false, 0.0f, 0.0f, 0.0f, false};
 
 static int16_t altitude = ALTITUDE_DEFAULT;
+static float temperatureOffset = TEMPERATURE_OFFSET_DEFAULT;
+static float pressureOffset = PRESSURE_OFFSET_DEFAULT;
+
+static char serialBuffer[16];
+static uint8_t serialIndex = 0;
 
 // ===================
 // INTERRUPT SERVICE ROUTINE
@@ -130,8 +138,8 @@ static bool readSensor() {
   sensorData.sensorOk = true;
   
   // Apply calibration offsets
-  rawTemp += TEMPERATURE_OFFSET;
-  rawPressure = (rawPressure / 100.0f) + PRESSURE_OFFSET;
+  rawTemp += temperatureOffset;
+  rawPressure = (rawPressure / 100.0f) + pressureOffset;
   
   sensorData.temperatureBuffer[sensorData.bufferIndex] = rawTemp;
   sensorData.pressureBuffer[sensorData.bufferIndex] = rawPressure;
@@ -168,15 +176,120 @@ static bool readSensor() {
 // ===================
 
 static void loadAltitude() {
-  EEPROM.get(EEPROM_ADDR, altitude);
+  EEPROM.get(EEPROM_ADDR_ALTITUDE, altitude);
   if (altitude < ALTITUDE_MIN || altitude > ALTITUDE_MAX) {
     altitude = ALTITUDE_DEFAULT;
-    EEPROM.put(EEPROM_ADDR, altitude);
+    EEPROM.put(EEPROM_ADDR_ALTITUDE, altitude);
   }
 }
 
 static void saveAltitude() {
-  EEPROM.put(EEPROM_ADDR, altitude);
+  EEPROM.put(EEPROM_ADDR_ALTITUDE, altitude);
+}
+
+static void loadOffsets() {
+  float tempVal, pressVal;
+  EEPROM.get(EEPROM_ADDR_TEMP_OFFSET, tempVal);
+  EEPROM.get(EEPROM_ADDR_PRESS_OFFSET, pressVal);
+  
+  if (isnan(tempVal) || tempVal < -50.0f || tempVal > 50.0f) {
+    temperatureOffset = TEMPERATURE_OFFSET_DEFAULT;
+    EEPROM.put(EEPROM_ADDR_TEMP_OFFSET, temperatureOffset);
+  } else {
+    temperatureOffset = tempVal;
+  }
+  
+  if (isnan(pressVal) || pressVal < -100.0f || pressVal > 100.0f) {
+    pressureOffset = PRESSURE_OFFSET_DEFAULT;
+    EEPROM.put(EEPROM_ADDR_PRESS_OFFSET, pressureOffset);
+  } else {
+    pressureOffset = pressVal;
+  }
+}
+
+static void saveTemperatureOffset() {
+  EEPROM.put(EEPROM_ADDR_TEMP_OFFSET, temperatureOffset);
+}
+
+static void savePressureOffset() {
+  EEPROM.put(EEPROM_ADDR_PRESS_OFFSET, pressureOffset);
+}
+
+// ===================
+// SERIAL COMMAND HANDLING
+// ===================
+
+static void processSerialCommand() {
+  if (serialIndex < 1) {
+    serialIndex = 0;
+    return;
+  }
+  
+  serialBuffer[serialIndex] = '\0';
+  char cmd = serialBuffer[0];
+  
+  if (cmd == 'C' || cmd == 'c' || cmd == '.') {
+    Serial.print(F("T="));
+    Serial.print(temperatureOffset);
+    Serial.print(F(" P="));
+    Serial.print(pressureOffset);
+    Serial.print(F(" A="));
+    Serial.println(altitude);
+    serialIndex = 0;
+    return;
+  }
+  
+  if (serialIndex < 2) {
+    serialIndex = 0;
+    return;
+  }
+  
+  float value = atof(&serialBuffer[1]);
+  
+  if (cmd == 'T' || cmd == 't') {
+    if (value >= -50.0f && value <= 50.0f) {
+      temperatureOffset = value;
+      saveTemperatureOffset();
+      Serial.print(F("Temperature offset: "));
+      Serial.println(temperatureOffset);
+    } else {
+      Serial.println(F("Error: T range -50 to 50"));
+    }
+  } else if (cmd == 'P' || cmd == 'p') {
+    if (value >= -100.0f && value <= 100.0f) {
+      pressureOffset = value;
+      savePressureOffset();
+      Serial.print(F("Pressure offset: "));
+      Serial.println(pressureOffset);
+    } else {
+      Serial.println(F("Error: P range -100 to 100"));
+    }
+  } else if (cmd == 'A' || cmd == 'a') {
+    int16_t altValue = (int16_t)value;
+    if (altValue >= ALTITUDE_MIN && altValue <= ALTITUDE_MAX) {
+      altitude = altValue;
+      saveAltitude();
+      Serial.print(F("Altitude: "));
+      Serial.println(altitude);
+    } else {
+      Serial.println(F("Error: A range 0 to 5000"));
+    }
+  }
+  
+  serialIndex = 0;
+}
+
+static void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialIndex > 0) {
+        processSerialCommand();
+      }
+    } else if (serialIndex < sizeof(serialBuffer) - 1) {
+      serialBuffer[serialIndex++] = c;
+    }
+  }
 }
 
 // ===================
@@ -296,9 +409,12 @@ static void updateDisplay() {
 // ===================
 
 void setup() {
+  Serial.begin(SERIAL_BAUD);
+  
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   
   loadAltitude();
+  loadOffsets();
   
   u8g2.begin();
   
@@ -326,6 +442,7 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
   
+  handleSerial();
   handleButton();
   
   if ((currentTime - timing.lastMeasurement) >= MEASUREMENT_INTERVAL) {
