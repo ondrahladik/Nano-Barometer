@@ -43,3 +43,7 @@ Send a command terminated with Enter (`\n`):
 - `A<value>` – sets altitude in meters (range `0` to `5000`)
 
 Examples: `T-1.3`, `P2.4`, `A285`
+
+***
+
+![Nano Barometer](image.jpeg)
